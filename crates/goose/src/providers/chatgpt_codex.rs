@@ -458,6 +458,12 @@ fn reasoning_effort_for_config(model_config: &ModelConfig) -> Option<String> {
         .unwrap_or_else(|| Some(get_reasoning_effort(&model_config.model_name)))
 }
 
+fn gpt_version(model_name: &str) -> Option<(u32, u32)> {
+    let version = model_name.strip_prefix("gpt-")?.split('-').next()?;
+    let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
 fn create_codex_request(
     model_config: &ModelConfig,
     system: &str,
@@ -465,17 +471,10 @@ fn create_codex_request(
     tools: &[Tool],
 ) -> Result<Value> {
     let mut input_items = build_input_items(messages, &model_config.model_name)?;
-    if !system.is_empty() {
-        input_items.insert(
-            0,
-            json!({ "type": "message", "role": "developer", "content": system }),
-        );
-    }
     let reasoning_effort = reasoning_effort_for_config(model_config);
 
     let mut payload = json!({
         "model": model_config.model_name,
-        "input": input_items,
         "store": false,
         "include": ["reasoning.encrypted_content"],
     });
@@ -483,6 +482,18 @@ fn create_codex_request(
     let payload_obj = payload
         .as_object_mut()
         .ok_or_else(|| anyhow!("Codex payload must be a JSON object"))?;
+
+    if gpt_version(&model_config.model_name).is_some_and(|version| version >= (6, 2)) {
+        if !system.is_empty() {
+            input_items.insert(
+                0,
+                json!({ "type": "message", "role": "developer", "content": system }),
+            );
+        }
+    } else {
+        payload_obj.insert("instructions".to_string(), json!(system));
+    }
+    payload_obj.insert("input".to_string(), Value::Array(input_items));
 
     if !tools.is_empty() {
         let tools_spec: Vec<Value> = tools
@@ -1922,9 +1933,11 @@ mod tests {
         assert!(names.contains(&"gpt-5.6"));
     }
 
-    #[test]
-    fn test_system_prompt_precedes_conversation_history() {
-        let model = ModelConfig::new("gpt-6.2-sol");
+    #[test_case("gpt-6.2-sol")]
+    #[test_case("gpt-6.10")]
+    #[test_case("gpt-7")]
+    fn test_system_prompt_precedes_conversation_history(model_name: &str) {
+        let model = ModelConfig::new(model_name);
         let system = "Follow the project guidelines.\nPreserve whitespace.\n";
         let messages = [
             Message::user().with_text("First question"),
@@ -1953,5 +1966,14 @@ mod tests {
         assert_eq!(payload["input"].as_array().unwrap().len(), 1);
         assert_eq!(payload["input"][0]["role"], "user");
         assert!(payload.get("instructions").is_none());
+    }
+
+    #[test_case("gpt-6.1-sol", "system prompt")]
+    #[test_case("unknown-model", "")]
+    fn test_system_prompt_in_top_level_instructions(model_name: &str, system: &str) {
+        let payload =
+            create_codex_request(&ModelConfig::new(model_name), system, &[], &[]).unwrap();
+        assert_eq!(payload["instructions"], system);
+        assert_eq!(payload["input"], json!([]));
     }
 }
